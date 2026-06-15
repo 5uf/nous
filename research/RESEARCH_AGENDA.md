@@ -1,5 +1,7 @@
 # Research Agenda
 
+> Implementation-decision analysis for these topics lives in [`comparisons/`](comparisons/README.md) — one file per area, each with: what to copy / avoid, performance & security implications, complexity, module mapping, MVP + long-term decisions.
+
 ## OS architecture
 
 - seL4/L4 IPC performance and verification lessons
