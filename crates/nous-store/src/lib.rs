@@ -1,0 +1,407 @@
+//! `nous-store` — content-addressed object store for the Nous workspace.
+//!
+//! Objects are keyed by their BLAKE3 digest ([`ObjectId`]).  All writes are
+//! atomic (write to `tmp/`, then rename).  Every `get` verifies the stored
+//! bytes against the id before returning them.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use nous_core::{Error, Meta, ObjectId, Result};
+
+// ---------------------------------------------------------------------------
+// Store
+// ---------------------------------------------------------------------------
+
+/// A content-addressed object store rooted at a single directory.
+///
+/// Layout:
+/// ```text
+/// <root>/
+///   config.toml           {version = 1, algo = "b3"}
+///   objects/ab/cd/<64hex> object bytes
+///   meta/<64hex>.toml     serialised Meta
+///   caps/                 (reserved, empty)
+///   logs/                 (reserved, empty)
+///   tmp/                  staging area for atomic writes
+/// ```
+pub struct Store {
+    root: PathBuf,
+}
+
+impl Store {
+    // -----------------------------------------------------------------------
+    // Construction
+    // -----------------------------------------------------------------------
+
+    /// Create the `.nous` skeleton at `root` (root **is** the `.nous` dir).
+    ///
+    /// Creates `objects/`, `meta/`, `caps/`, `logs/`, `tmp/`, and writes
+    /// `config.toml`.  Idempotent — calling `init` on an existing store is
+    /// safe.
+    pub fn init(root: &Path) -> Result<Store> {
+        for subdir in &["objects", "meta", "caps", "logs", "tmp"] {
+            std::fs::create_dir_all(root.join(subdir))?;
+        }
+        let cfg = root.join("config.toml");
+        if !cfg.exists() {
+            std::fs::write(&cfg, "version = 1\nalgo = \"b3\"\n")?;
+        }
+        Ok(Store { root: root.to_path_buf() })
+    }
+
+    /// Open an existing store.
+    ///
+    /// Returns [`Error::NotFound`] if `root/config.toml` is absent.
+    pub fn open(root: &Path) -> Result<Store> {
+        let cfg = root.join("config.toml");
+        if !cfg.exists() {
+            return Err(Error::NotFound(format!(
+                "config.toml not found in {}",
+                root.display()
+            )));
+        }
+        Ok(Store { root: root.to_path_buf() })
+    }
+
+    // -----------------------------------------------------------------------
+    // Accessors
+    // -----------------------------------------------------------------------
+
+    /// Return the root directory of this store.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    // -----------------------------------------------------------------------
+    // Write
+    // -----------------------------------------------------------------------
+
+    /// Hash `data`, write the object and its sidecar metadata, return the id.
+    ///
+    /// Idempotent — re-putting identical bytes returns the same id without
+    /// error and without redundant disk writes.
+    pub fn put(&self, data: &[u8], content_type: Option<String>) -> Result<ObjectId> {
+        let id = ObjectId::of_bytes(data);
+
+        // Fast-path: already stored.
+        if self.has(&id) {
+            return Ok(id);
+        }
+
+        // --- object bytes (atomic) ------------------------------------------
+        let obj_path = self.object_path(&id);
+        std::fs::create_dir_all(obj_path.parent().unwrap())?;
+        let tmp_obj = self.unique_tmp("obj");
+        std::fs::write(&tmp_obj, data)?;
+        std::fs::rename(&tmp_obj, &obj_path)?;
+
+        // --- meta sidecar (atomic) ------------------------------------------
+        let meta = Meta {
+            id: id.to_string(),
+            algo: id.algo.name().to_owned(),
+            size: data.len() as u64,
+            created: current_timestamp(),
+            content_type,
+        };
+        let toml_str = toml::to_string(&meta)
+            .map_err(|e| Error::Other(format!("toml serialise: {e}")))?;
+        let meta_path = self.meta_path(&id);
+        let tmp_meta = self.unique_tmp("meta");
+        std::fs::write(&tmp_meta, toml_str)?;
+        std::fs::rename(&tmp_meta, &meta_path)?;
+
+        Ok(id)
+    }
+
+    /// Read a file from disk and store it.  `content_type` is left `None`.
+    pub fn put_path(&self, path: &Path) -> Result<ObjectId> {
+        let data = std::fs::read(path)?;
+        self.put(&data, None)
+    }
+
+    // -----------------------------------------------------------------------
+    // Read
+    // -----------------------------------------------------------------------
+
+    /// Read object bytes, verifying integrity on every read.
+    ///
+    /// Returns [`Error::NotFound`] if absent, [`Error::Corrupt`] if the
+    /// stored bytes do not match the id.
+    pub fn get(&self, id: &ObjectId) -> Result<Vec<u8>> {
+        let path = self.object_path(id);
+        if !path.exists() {
+            return Err(Error::NotFound(id.to_string()));
+        }
+        let data = std::fs::read(&path)?;
+        let actual = ObjectId::of_bytes(&data);
+        if actual != *id {
+            return Err(Error::Corrupt {
+                expected: id.to_string(),
+                actual: actual.to_string(),
+            });
+        }
+        Ok(data)
+    }
+
+    /// Read the metadata sidecar for an object.
+    pub fn get_meta(&self, id: &ObjectId) -> Result<Meta> {
+        let path = self.meta_path(id);
+        if !path.exists() {
+            return Err(Error::NotFound(id.to_string()));
+        }
+        let raw = std::fs::read_to_string(&path)?;
+        toml::from_str::<Meta>(&raw).map_err(|e| Error::Corrupt {
+            expected: "valid Meta toml".into(),
+            actual: e.to_string(),
+        })
+    }
+
+    /// Return `true` if the object is present in the store.
+    pub fn has(&self, id: &ObjectId) -> bool {
+        self.object_path(id).exists()
+    }
+
+    /// List all stored object ids by scanning the `meta/` directory.
+    pub fn list(&self) -> Result<Vec<ObjectId>> {
+        let meta_dir = self.root.join("meta");
+        let mut ids = Vec::new();
+        for entry in std::fs::read_dir(&meta_dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            // Each file is named "<64hex>.toml"
+            if let Some(hex) = name.strip_suffix(".toml") {
+                if let Ok(id) = format!("b3:{hex}").parse::<ObjectId>() {
+                    ids.push(id);
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Recompute the hash of the stored bytes and compare to `id`.
+    ///
+    /// Returns `true` if the object is intact.  Returns [`Error::NotFound`]
+    /// if the object does not exist.
+    pub fn verify(&self, id: &ObjectId) -> Result<bool> {
+        let path = self.object_path(id);
+        if !path.exists() {
+            return Err(Error::NotFound(id.to_string()));
+        }
+        let data = std::fs::read(&path)?;
+        Ok(ObjectId::of_bytes(&data) == *id)
+    }
+
+    // -----------------------------------------------------------------------
+    // Private helpers
+    // -----------------------------------------------------------------------
+
+    fn object_path(&self, id: &ObjectId) -> PathBuf {
+        let (a, b) = id.shard();
+        self.root.join("objects").join(a).join(b).join(id.hex())
+    }
+
+    fn meta_path(&self, id: &ObjectId) -> PathBuf {
+        self.root.join("meta").join(format!("{}.toml", id.hex()))
+    }
+
+    fn unique_tmp(&self, tag: &str) -> PathBuf {
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        self.root
+            .join("tmp")
+            .join(format!("{tag}-{}-{n}", std::process::id()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Timestamp helper
+// ---------------------------------------------------------------------------
+
+/// Return the current Unix timestamp in seconds.
+///
+/// Honours `SOURCE_DATE_EPOCH` for reproducible builds; falls back to the
+/// system clock.
+fn current_timestamp() -> i64 {
+    if let Ok(val) = std::env::var("SOURCE_DATE_EPOCH") {
+        if let Ok(secs) = val.trim().parse::<i64>() {
+            return secs;
+        }
+    }
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn tmp_root(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("nous-store-test-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn init_creates_skeleton() {
+        let root = tmp_root("init");
+        Store::init(&root).expect("init");
+
+        assert!(root.join("config.toml").exists(), "config.toml missing");
+        for sub in &["objects", "meta", "caps", "logs", "tmp"] {
+            assert!(root.join(sub).is_dir(), "{sub} dir missing");
+        }
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn init_is_idempotent() {
+        let root = tmp_root("init-idem");
+        Store::init(&root).expect("first init");
+        Store::init(&root).expect("second init should not error");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn put_get_round_trip() {
+        let root = tmp_root("put-get");
+        let store = Store::init(&root).expect("init");
+
+        let data = b"hello, nous store!";
+        let id = store.put(data, None).expect("put");
+
+        assert_eq!(id, ObjectId::of_bytes(data));
+
+        let back = store.get(&id).expect("get");
+        assert_eq!(back.as_slice(), data);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn put_is_idempotent() {
+        let root = tmp_root("put-idem");
+        let store = Store::init(&root).expect("init");
+
+        let data = b"idempotent data";
+        let id1 = store.put(data, None).expect("first put");
+        let id2 = store.put(data, None).expect("second put");
+        assert_eq!(id1, id2);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn get_meta_correct_size() {
+        let root = tmp_root("meta-size");
+        let store = Store::init(&root).expect("init");
+
+        let data = b"size check data";
+        let id = store.put(data, Some("text/plain".into())).expect("put");
+        let meta = store.get_meta(&id).expect("get_meta");
+
+        assert_eq!(meta.size, data.len() as u64);
+        assert_eq!(meta.content_type.as_deref(), Some("text/plain"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn verify_good_object() {
+        let root = tmp_root("verify-good");
+        let store = Store::init(&root).expect("init");
+
+        let id = store.put(b"verify me", None).expect("put");
+        assert!(store.verify(&id).expect("verify"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn corrupt_object_detected() {
+        let root = tmp_root("corrupt");
+        let store = Store::init(&root).expect("init");
+
+        let data = b"original content";
+        let id = store.put(data, None).expect("put");
+
+        // Overwrite the object file with garbage.
+        let (a, b) = id.shard();
+        let obj_path = root.join("objects").join(a).join(b).join(id.hex());
+        fs::write(&obj_path, b"CORRUPTED DATA").expect("corrupt write");
+
+        // get() must return Corrupt.
+        match store.get(&id) {
+            Err(Error::Corrupt { .. }) => {}
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+
+        // verify() must return false.
+        assert!(!store.verify(&id).expect("verify call"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn list_returns_put_ids() {
+        let root = tmp_root("list");
+        let store = Store::init(&root).expect("init");
+
+        let id1 = store.put(b"object one", None).expect("put 1");
+        let id2 = store.put(b"object two", None).expect("put 2");
+
+        let mut listed = store.list().expect("list");
+        listed.sort_by_key(|id| id.hex());
+
+        let mut expected = vec![id1, id2];
+        expected.sort_by_key(|id| id.hex());
+
+        assert_eq!(listed, expected);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn get_unknown_id_not_found() {
+        let root = tmp_root("not-found");
+        let store = Store::init(&root).expect("init");
+
+        let id = ObjectId::of_bytes(b"this is never stored");
+        match store.get(&id) {
+            Err(Error::NotFound(_)) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn open_fails_without_config() {
+        let root = tmp_root("open-fail");
+        fs::create_dir_all(&root).ok();
+        match Store::open(&root) {
+            Err(Error::NotFound(_)) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn source_date_epoch_respected() {
+        std::env::set_var("SOURCE_DATE_EPOCH", "1000000");
+        let ts = current_timestamp();
+        std::env::remove_var("SOURCE_DATE_EPOCH");
+        assert_eq!(ts, 1_000_000);
+    }
+}

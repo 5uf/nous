@@ -1,0 +1,15 @@
+[package]
+name    = "nous-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "nous"
+path = "src/main.rs"
+
+[dependencies]
+nous-core  = { path = "../nous-core" }
+nous-store = { path = "../nous-store" }
+nous-caps  = { path = "../nous-caps" }
+nous-http  = { path = "../nous-http" }
+clap       = { workspace = true }
