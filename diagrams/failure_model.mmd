@@ -1,0 +1,12 @@
+flowchart TD
+    K[Kernel] --> S[Service Supervisor]
+    S --> UI[UI Shell]
+    S --> NET[Network Service]
+    S --> FS[Storage Service]
+    S --> GPU[Graphics Driver Service]
+    S --> AI[AI Model Service]
+    UI -->|crash| S
+    NET -->|crash| S
+    FS -->|fault| R[Rollback/Repair]
+    GPU -->|hang| G[Reset/Fallback]
+    AI -->|runaway| Q[Quota/Revoke Caps]

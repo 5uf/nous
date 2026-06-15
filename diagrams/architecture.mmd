@@ -1,0 +1,10 @@
+flowchart TD
+    A[Existing OS: Linux/macOS/Windows/Android] --> B[NousBridge]
+    B --> C[NousCaps]
+    C --> D[NousFS]
+    C --> E[NousNet]
+    C --> F[NousAI]
+    C --> G[NousVM]
+    H[NousOS Kernel Optional] --> C
+    H --> I[Scheduler/Memory/IPC/Timers]
+    H --> J[User-space Drivers]
