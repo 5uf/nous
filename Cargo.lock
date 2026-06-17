@@ -382,6 +382,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 
 [[package]]
+name = "nous-bridge"
+version = "0.1.0"
+dependencies = [
+ "nous-core",
+ "nous-store",
+]
+
+[[package]]
 name = "nous-caps"
 version = "0.1.0"
 dependencies = [
@@ -398,6 +406,7 @@ name = "nous-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "nous-bridge",
  "nous-caps",
  "nous-core",
  "nous-http",

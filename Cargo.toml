@@ -5,6 +5,7 @@ members = [
     "crates/nous-store",
     "crates/nous-caps",
     "crates/nous-http",
+    "crates/nous-bridge",
     "crates/nous-cli",
 ]
 

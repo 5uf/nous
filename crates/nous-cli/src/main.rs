@@ -123,6 +123,36 @@ enum Command {
         kind: GrantKind,
     },
 
+    /// Snapshot a directory into a content-addressed commit.
+    Snapshot {
+        /// Directory to snapshot.
+        dir: PathBuf,
+        /// Commit message.
+        #[arg(short, long)]
+        message: String,
+        /// Optional parent commit id.
+        #[arg(long)]
+        parent: Option<String>,
+        /// Author name (default: "nous").
+        #[arg(long, default_value = "nous")]
+        author: String,
+    },
+
+    /// Restore a commit's tree to a directory.
+    Restore {
+        /// Commit id to restore.
+        commit: String,
+        /// Destination directory.
+        #[arg(long)]
+        out: PathBuf,
+    },
+
+    /// Show commit history (first-parent chain).
+    Log {
+        /// Commit id to start from.
+        commit: String,
+    },
+
     /// Generate an Ed25519 issuer key for signing capabilities.
     Keygen,
 
@@ -139,6 +169,15 @@ enum GrantKind {
     Read {
         /// Content ID of the object to grant access to.
         cid: String,
+        /// Duration the token is valid for (e.g. 10m, 1h, 30s, 2d).
+        #[arg(long)]
+        ttl: String,
+        /// Sign the token with the store's issuer key (run `nous keygen` first).
+        #[arg(long)]
+        sign: bool,
+    },
+    /// Grant write access to the store (POST /object).
+    Write {
         /// Duration the token is valid for (e.g. 10m, 1h, 30s, 2d).
         #[arg(long)]
         ttl: String,
@@ -333,7 +372,52 @@ fn run() -> Result<()> {
                 }
                 println!("{}", cap.encode());
             }
+            GrantKind::Write { ttl, sign } => {
+                let ttl_secs = parse_ttl(&ttl)?;
+                let resource = nous_caps::store_write_resource();
+                let mut cap =
+                    Capability::grant(&resource, vec![nous_core::Right::Write], ttl_secs);
+                if sign {
+                    let key = load_issuer_key()?;
+                    cap.sign(&key);
+                }
+                println!("{}", cap.encode());
+            }
         },
+
+        Command::Snapshot { dir, message, parent, author } => {
+            let path = nous_dir()?;
+            let store = Store::open(&path)?;
+            let parent_id = match parent {
+                Some(p) => Some(ObjectId::from_str(&p)?),
+                None => None,
+            };
+            let commit =
+                nous_bridge::snapshot(&store, &dir, &author, &message, parent_id, now_secs())?;
+            println!("{commit}");
+        }
+
+        Command::Restore { commit, out } => {
+            let id = ObjectId::from_str(&commit)?;
+            let path = nous_dir()?;
+            let store = Store::open(&path)?;
+            nous_bridge::restore(&store, &id, &out)?;
+            println!("restored {} -> {}", commit, out.display());
+        }
+
+        Command::Log { commit } => {
+            let id = ObjectId::from_str(&commit)?;
+            let path = nous_dir()?;
+            let store = Store::open(&path)?;
+            for (cid, c) in nous_bridge::log(&store, &id)? {
+                println!("commit {cid}");
+                println!("    author:  {}", c.author);
+                println!("    date:    {}", c.timestamp);
+                println!("    tree:    {}", c.tree);
+                println!("    message: {}", c.message);
+                println!();
+            }
+        }
 
         Command::Keygen => {
             let path = issuer_key_path()?;

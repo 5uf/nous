@@ -148,6 +148,20 @@ impl Capability {
 }
 
 // ---------------------------------------------------------------------------
+// Well-known resources
+// ---------------------------------------------------------------------------
+
+/// The sentinel resource a write capability must grant to permit writes to the
+/// store via the HTTP gateway.
+///
+/// Writes are not tied to a specific object id (the id is only known *after*
+/// storing the bytes), so write authorization is checked against this constant
+/// resource instead of a content id.
+pub fn store_write_resource() -> ObjectId {
+    ObjectId::of_bytes(b"nous:store:write")
+}
+
+// ---------------------------------------------------------------------------
 // Ed25519 issuer keys + signing
 // ---------------------------------------------------------------------------
 
@@ -490,6 +504,20 @@ mod tests {
         assert!(!cap.verify_from(&untrusted, Right::Read, &res, 0));
         // trusted but wrong right
         assert!(!cap.verify_from(&trusted, Right::Write, &res, 0));
+    }
+
+    #[test]
+    fn signed_write_cap_on_sentinel_verifies() {
+        let key = IssuerKey::generate().unwrap();
+        let res = store_write_resource();
+        let mut cap = Capability::grant(&res, vec![Right::Write], 3600);
+        cap.sign(&key);
+        let trusted = vec![key.public_b64()];
+        assert!(cap.verify_from(&trusted, Right::Write, &res, 0));
+        // a read cap on the sentinel must not satisfy a write check
+        let mut rd = Capability::new_read(&res, 3600);
+        rd.sign(&key);
+        assert!(!rd.verify_from(&trusted, Right::Write, &res, 0));
     }
 
     #[test]

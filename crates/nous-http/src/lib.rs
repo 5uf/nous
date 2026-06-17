@@ -194,12 +194,14 @@ fn handle_get_meta(
 }
 
 fn handle_post_object(store: &Store, mut request: Request, policy: &CapPolicy) -> u16 {
-    // Writes are not yet cap-gated by a Right::Write capability. Until that is
-    // designed, deny all writes when enforcement is on (fail closed) rather
-    // than silently accepting unauthenticated writes.
+    // Writes require a signed Right::Write capability on the store-write
+    // sentinel resource (the object id is unknown until after storing).
     if policy.enforce {
-        send(request, 403, "text/plain", b"writes are not permitted when caps are enforced".to_vec());
-        return 403;
+        let write_resource = nous_caps::store_write_resource();
+        if let Some(status) = check_cap(&request, Right::Write, &write_resource, policy) {
+            send(request, status, "text/plain", cap_error_body(status));
+            return status;
+        }
     }
 
     let content_type = header_value(&request, "content-type").map(|s| s.to_owned());
