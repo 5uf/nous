@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use nous_core::{Commit, Error, Manifest, Meta, Object, ObjectId, Result, Tree};
+use nous_core::{Commit, Error, File, Manifest, Meta, Object, ObjectId, Result, Tree};
 
 // ---------------------------------------------------------------------------
 // Store
@@ -236,6 +236,51 @@ impl Store {
             Object::Manifest(m) => Ok(m),
             other => Err(Error::Other(format!("expected manifest, got {:?}", other.kind()))),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Large files via content-defined chunking (Phase 3)
+    // -----------------------------------------------------------------------
+
+    /// Store `data` as a content-defined-chunked [`File`]: each chunk is stored
+    /// as a blob (deduplicated by content), then a `File` object listing the
+    /// chunk ids in order is stored. Returns the `File` object id.
+    pub fn put_file(&self, data: &[u8]) -> Result<ObjectId> {
+        let mut chunk_ids = Vec::new();
+        for ch in nous_core::chunk::chunks(data) {
+            chunk_ids.push(self.put(ch, Some("application/nous-chunk".to_string()))?);
+        }
+        let file = Object::File(File {
+            size: data.len() as u64,
+            chunks: chunk_ids,
+        });
+        self.put_object(&file)
+    }
+
+    /// Reassemble a chunked [`File`] by concatenating its chunks in order.
+    /// Each chunk is verified on read; the total length is checked against the
+    /// recorded size (mismatch → [`Error::Corrupt`]).
+    pub fn get_file(&self, id: &ObjectId) -> Result<Vec<u8>> {
+        let file = match self.get_object(id)? {
+            Object::File(f) => f,
+            other => {
+                return Err(Error::Other(format!(
+                    "expected file, got {:?}",
+                    other.kind()
+                )))
+            }
+        };
+        let mut out = Vec::with_capacity(file.size as usize);
+        for cid in &file.chunks {
+            out.extend_from_slice(&self.get(cid)?);
+        }
+        if out.len() as u64 != file.size {
+            return Err(Error::Corrupt {
+                expected: format!("{} bytes", file.size),
+                actual: format!("{} bytes", out.len()),
+            });
+        }
+        Ok(out)
     }
 
     // -----------------------------------------------------------------------
@@ -470,6 +515,54 @@ mod tests {
 
         assert_eq!(id, obj.id());
         assert_eq!(store.get_tree(&id).unwrap(), tree);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn put_get_file_round_trip_large() {
+        let root = tmp_root("file-rt");
+        let store = Store::init(&root).unwrap();
+        let data: Vec<u8> = (0..500_000u32).map(|i| (i ^ (i >> 3)) as u8).collect();
+
+        let id = store.put_file(&data).unwrap();
+        let got = store.get_file(&id).unwrap();
+        assert_eq!(got, data);
+        // multi-chunk: the File object lists more than one chunk
+        match store.get_object(&id).unwrap() {
+            Object::File(f) => {
+                assert_eq!(f.size, data.len() as u64);
+                assert!(f.chunks.len() > 1, "large file should be multi-chunk");
+            }
+            _ => panic!("expected file"),
+        }
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn put_file_is_deduplicating_and_idempotent() {
+        let root = tmp_root("file-dedup");
+        let store = Store::init(&root).unwrap();
+        let data: Vec<u8> = (0..300_000u32).map(|i| (i * 7) as u8).collect();
+
+        let id1 = store.put_file(&data).unwrap();
+        let id2 = store.put_file(&data).unwrap();
+        assert_eq!(id1, id2, "same content -> same File id");
+
+        // All chunks are already present after the first put.
+        if let Object::File(f) = store.get_object(&id1).unwrap() {
+            for cid in &f.chunks {
+                assert!(store.has(cid), "chunk should be stored");
+            }
+        }
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn empty_file_round_trip() {
+        let root = tmp_root("file-empty");
+        let store = Store::init(&root).unwrap();
+        let id = store.put_file(b"").unwrap();
+        assert_eq!(store.get_file(&id).unwrap(), Vec::<u8>::new());
         fs::remove_dir_all(&root).ok();
     }
 

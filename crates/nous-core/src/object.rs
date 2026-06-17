@@ -25,6 +25,7 @@ pub enum ObjectKind {
     Tree,
     Commit,
     Manifest,
+    File,
 }
 
 /// One entry in a [`Tree`]: a name bound to the id of a blob or subtree.
@@ -54,6 +55,16 @@ pub struct Commit {
     pub timestamp: i64,
 }
 
+/// A large file split into content-defined chunks. The chunk ids reference
+/// blobs (stored separately); concatenating them in order reproduces the file.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct File {
+    /// Total byte length of the reassembled file.
+    pub size: u64,
+    /// Ordered chunk blob ids.
+    pub chunks: Vec<ObjectId>,
+}
+
 /// A named, versioned pointer to a root object plus arbitrary metadata.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
@@ -72,6 +83,7 @@ pub enum Object {
     Tree(Tree),
     Commit(Commit),
     Manifest(Manifest),
+    File(File),
 }
 
 impl Tree {
@@ -107,6 +119,7 @@ impl Object {
             Object::Tree(_) => ObjectKind::Tree,
             Object::Commit(_) => ObjectKind::Commit,
             Object::Manifest(_) => ObjectKind::Manifest,
+            Object::File(_) => ObjectKind::File,
         }
     }
 }

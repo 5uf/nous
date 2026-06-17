@@ -77,6 +77,10 @@ enum Command {
     Put {
         /// Path to the file to store.
         file: PathBuf,
+        /// Split into content-defined chunks (dedup large files); stores a
+        /// File object referencing the chunks.
+        #[arg(long)]
+        chunked: bool,
     },
 
     /// Retrieve a stored object and write it to a file.
@@ -226,10 +230,15 @@ fn run() -> Result<()> {
             println!("initialized {}", abs.display());
         }
 
-        Command::Put { file } => {
+        Command::Put { file, chunked } => {
             let path = nous_dir()?;
             let store = Store::open(&path)?;
-            let id = store.put_path(&file)?;
+            let id = if chunked {
+                let data = std::fs::read(&file).map_err(Error::Io)?;
+                store.put_file(&data)?
+            } else {
+                store.put_path(&file)?
+            };
             println!("{id}");
         }
 
@@ -237,9 +246,18 @@ fn run() -> Result<()> {
             let id = ObjectId::from_str(&cid)?;
             let path = nous_dir()?;
             let store = Store::open(&path)?;
-            let bytes = store.get(&id)?;
-            std::fs::write(&out, &bytes)
-                .map_err(|e| nous_core::Error::Io(e))?;
+            // Transparently reassemble chunked File objects; otherwise read
+            // the raw blob.
+            let is_file = matches!(
+                store.get_meta(&id).ok().and_then(|m| m.content_type),
+                Some(ref ct) if ct == "application/nous-file"
+            );
+            let bytes = if is_file {
+                store.get_file(&id)?
+            } else {
+                store.get(&id)?
+            };
+            std::fs::write(&out, &bytes).map_err(|e| nous_core::Error::Io(e))?;
             println!("wrote {}", out.display());
         }
 
