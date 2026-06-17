@@ -11,7 +11,8 @@ use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use nous_core::{ObjectId, Right};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use nous_core::{Error, ObjectId, Right};
 
 // ---------------------------------------------------------------------------
 // Capability
@@ -22,6 +23,7 @@ use nous_core::{ObjectId, Right};
 /// Tokens are serialised as `base64url_nopad(JSON)` so they are opaque to
 /// callers but self-describing to any party that decodes them.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Capability {
     /// Unique identifier for this capability (random hex).
     pub cap_id: String,
@@ -47,48 +49,22 @@ pub struct Capability {
 // Entropy helper
 // ---------------------------------------------------------------------------
 
-/// Generate a 16-byte pseudo-random hex string without an external RNG crate.
-///
-/// Combines `SystemTime` nanoseconds and the OS process-id, then hashes with
-/// a simple mix to spread bits.  Suitable for v0 unsigned local tokens; not
-/// cryptographically strong on its own.
+/// Generate a 16-byte cryptographically-random hex id from the OS CSPRNG.
 fn random_hex_id() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos() as u64;
-    let pid = std::process::id() as u64;
-
-    // Simple mixing: combine fields and run a few rounds of xorshift.
-    let mut x = nanos ^ (pid << 32) ^ (counter.wrapping_mul(0x9e37_79b9_7f4a_7c15));
-    x ^= x >> 30;
-    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    x ^= x >> 27;
-    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
-    x ^= x >> 31;
-
-    // Use two 64-bit values for 16 bytes of entropy.
-    let y = x
-        .wrapping_add(counter)
-        .wrapping_mul(0x517c_c1b7_2722_0a95);
-
-    format!("{x:016x}{y:016x}")
+    let mut buf = [0u8; 16];
+    getrandom::getrandom(&mut buf).expect("OS CSPRNG failure");
+    buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 // ---------------------------------------------------------------------------
-// Unix-seconds "now" helper (respects SOURCE_DATE_EPOCH for reproducibility)
+// Unix-seconds "now" helper
 // ---------------------------------------------------------------------------
 
+/// Current Unix seconds from the real clock only.
+///
+/// Capability expiry is a security boundary, so this intentionally does NOT
+/// honour `SOURCE_DATE_EPOCH` (which an attacker could set to rewind time).
 fn now_unix_secs() -> i64 {
-    if let Ok(val) = std::env::var("SOURCE_DATE_EPOCH") {
-        if let Ok(secs) = val.trim().parse::<i64>() {
-            return secs;
-        }
-    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -168,6 +144,118 @@ impl Capability {
         self.is_valid(now)
             && self.resource == resource.to_string()
             && self.rights.contains(&right)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ed25519 issuer keys + signing
+// ---------------------------------------------------------------------------
+
+/// An Ed25519 issuer key used to sign capabilities.
+///
+/// The 32-byte seed *is* the secret; keep it confidential. The public key is
+/// embedded (base64url) in a signed capability's `issuer` field.
+pub struct IssuerKey {
+    signing: SigningKey,
+}
+
+impl IssuerKey {
+    /// Generate a fresh key from the OS CSPRNG.
+    pub fn generate() -> nous_core::Result<IssuerKey> {
+        let mut seed = [0u8; 32];
+        getrandom::getrandom(&mut seed)
+            .map_err(|e| Error::Cap(format!("rng failure: {e}")))?;
+        let key = IssuerKey { signing: SigningKey::from_bytes(&seed) };
+        seed.fill(0); // best-effort zeroing of the local copy
+        Ok(key)
+    }
+
+    /// Reconstruct from a 32-byte secret seed.
+    pub fn from_seed(seed: &[u8; 32]) -> IssuerKey {
+        IssuerKey { signing: SigningKey::from_bytes(seed) }
+    }
+
+    /// The 32-byte secret seed (for persistence). Handle as a secret.
+    pub fn to_seed_bytes(&self) -> [u8; 32] {
+        self.signing.to_bytes()
+    }
+
+    /// Public verifying key, base64url-nopad encoded.
+    pub fn public_b64(&self) -> String {
+        URL_SAFE_NO_PAD.encode(self.signing.verifying_key().to_bytes())
+    }
+}
+
+impl Capability {
+    /// Canonical bytes signed over: this capability with `signature` cleared.
+    /// `alg` and `issuer` ARE included so the algorithm and key are bound to
+    /// the signature and cannot be swapped after the fact.
+    fn signing_payload(&self) -> Vec<u8> {
+        let mut bare = self.clone();
+        bare.signature = None;
+        serde_json::to_vec(&bare).expect("Capability serialization is infallible")
+    }
+
+    /// Sign this capability with `key`. Sets `alg = "ed25519"`, `issuer` to the
+    /// signer's public key (base64url), and `signature` to the detached
+    /// Ed25519 signature over [`signing_payload`].
+    pub fn sign(&mut self, key: &IssuerKey) {
+        self.alg = "ed25519".to_string();
+        self.issuer = key.public_b64();
+        self.signature = None;
+        let payload = self.signing_payload();
+        let sig = key.signing.sign(&payload);
+        self.signature = Some(URL_SAFE_NO_PAD.encode(sig.to_bytes()));
+    }
+
+    /// Verify the signature is internally consistent: `alg == "ed25519"`, the
+    /// `signature` is a valid Ed25519 signature over the payload by the key in
+    /// `issuer`.
+    ///
+    /// NOTE (v0 trust limitation): this only proves the cap was signed by
+    /// whoever owns the key named in `issuer`. It does NOT establish that the
+    /// issuer is trusted. Callers enforcing authorization MUST additionally
+    /// check `issuer` against a trusted-issuer allowlist (see
+    /// [`Capability::verify_from`]).
+    pub fn verify_signature(&self) -> bool {
+        if self.alg != "ed25519" {
+            return false;
+        }
+        let Some(sig_b64) = self.signature.as_deref() else { return false };
+
+        let Ok(pk_bytes) = URL_SAFE_NO_PAD.decode(self.issuer.as_bytes()) else { return false };
+        let Ok(pk_arr): std::result::Result<[u8; 32], _> = pk_bytes.try_into() else { return false };
+        let Ok(vk) = VerifyingKey::from_bytes(&pk_arr) else { return false };
+
+        let Ok(sig_bytes) = URL_SAFE_NO_PAD.decode(sig_b64.as_bytes()) else { return false };
+        let Ok(sig_arr): std::result::Result<[u8; 64], _> = sig_bytes.try_into() else { return false };
+        let sig = Signature::from_bytes(&sig_arr);
+
+        // verify_strict enforces RFC 8032 canonical encodings (rejects
+        // non-canonical R/S and the small-order pitfalls), which is the
+        // right choice for a non-consensus capability system.
+        vk.verify_strict(&self.signing_payload(), &sig).is_ok()
+    }
+
+    /// `true` iff the signature verifies AND the token is unexpired at `now`.
+    /// Does NOT check issuer trust — see [`Capability::verify_from`].
+    pub fn verify(&self, now: i64) -> bool {
+        self.verify_signature() && self.is_valid(now)
+    }
+
+    /// Full authorization check for a signed capability: signature verifies,
+    /// the `issuer` is one of `trusted_issuers` (base64url public keys), the
+    /// token is unexpired, grants `right`, and matches `resource`.
+    pub fn verify_from(
+        &self,
+        trusted_issuers: &[String],
+        right: Right,
+        resource: &ObjectId,
+        now: i64,
+    ) -> bool {
+        self.verify_signature()
+            && trusted_issuers.iter().any(|k| k == &self.issuer)
+            && self.allows(right, resource, now)
     }
 }
 
@@ -321,5 +409,94 @@ mod tests {
             matches!(err, Err(nous_core::Error::Cap(_))),
             "expected Error::Cap, got {err:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Ed25519 signing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sign_then_verify_round_trip() {
+        let key = IssuerKey::generate().unwrap();
+        let res = test_resource();
+        let mut cap = Capability::new_read(&res, 3600);
+        cap.sign(&key);
+
+        assert_eq!(cap.alg, "ed25519");
+        assert_eq!(cap.issuer, key.public_b64());
+        assert!(cap.signature.is_some());
+        assert!(cap.verify_signature());
+        assert!(cap.verify(0));
+    }
+
+    #[test]
+    fn signed_cap_survives_encode_decode() {
+        let key = IssuerKey::generate().unwrap();
+        let mut cap = Capability::new_read(&test_resource(), 3600);
+        cap.sign(&key);
+        let decoded = Capability::decode(&cap.encode()).unwrap();
+        assert!(decoded.verify_signature());
+    }
+
+    #[test]
+    fn tampered_resource_fails_verification() {
+        let key = IssuerKey::generate().unwrap();
+        let mut cap = Capability::new_read(&test_resource(), 3600);
+        cap.sign(&key);
+        cap.resource = other_resource().to_string(); // tamper after signing
+        assert!(!cap.verify_signature());
+    }
+
+    #[test]
+    fn wrong_key_fails_verification() {
+        let key = IssuerKey::generate().unwrap();
+        let attacker = IssuerKey::generate().unwrap();
+        let mut cap = Capability::new_read(&test_resource(), 3600);
+        cap.sign(&key);
+        cap.issuer = attacker.public_b64(); // claim a different issuer
+        assert!(!cap.verify_signature());
+    }
+
+    #[test]
+    fn unsigned_cap_does_not_verify() {
+        let cap = Capability::new_read(&test_resource(), 3600);
+        assert_eq!(cap.alg, "none");
+        assert!(!cap.verify_signature());
+        assert!(!cap.verify(0));
+    }
+
+    #[test]
+    fn verify_rejects_expired_even_if_signature_valid() {
+        let key = IssuerKey::generate().unwrap();
+        let mut cap = Capability::new_read(&test_resource(), 3600);
+        cap.expiry = 1_000;
+        cap.sign(&key);
+        assert!(cap.verify_signature()); // signature still valid
+        assert!(!cap.verify(2_000)); // but expired
+    }
+
+    #[test]
+    fn verify_from_enforces_trusted_issuer() {
+        let key = IssuerKey::generate().unwrap();
+        let res = test_resource();
+        let mut cap = Capability::new_read(&res, 3600);
+        cap.sign(&key);
+
+        let trusted = vec![key.public_b64()];
+        assert!(cap.verify_from(&trusted, Right::Read, &res, 0));
+
+        // untrusted issuer list
+        let untrusted = vec![IssuerKey::generate().unwrap().public_b64()];
+        assert!(!cap.verify_from(&untrusted, Right::Read, &res, 0));
+        // trusted but wrong right
+        assert!(!cap.verify_from(&trusted, Right::Write, &res, 0));
+    }
+
+    #[test]
+    fn issuer_key_seed_round_trip() {
+        let key = IssuerKey::generate().unwrap();
+        let seed = key.to_seed_bytes();
+        let restored = IssuerKey::from_seed(&seed);
+        assert_eq!(key.public_b64(), restored.public_b64());
     }
 }

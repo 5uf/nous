@@ -6,9 +6,11 @@
 mod error;
 mod id;
 mod meta;
+mod object;
 mod rights;
 
 pub use error::{Error, Result};
 pub use id::{HashAlgo, ObjectId};
 pub use meta::Meta;
+pub use object::{Commit, Manifest, Object, ObjectKind, Tree, TreeEntry};
 pub use rights::Right;

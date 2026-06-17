@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use nous_core::{Error, Meta, ObjectId, Result};
+use nous_core::{Commit, Error, Manifest, Meta, Object, ObjectId, Result, Tree};
 
 // ---------------------------------------------------------------------------
 // Store
@@ -193,6 +193,49 @@ impl Store {
         }
         let data = std::fs::read(&path)?;
         Ok(ObjectId::of_bytes(&data) == *id)
+    }
+
+    // -----------------------------------------------------------------------
+    // Typed objects (Phase 2)
+    // -----------------------------------------------------------------------
+
+    /// Store a structured [`Object`] (encoded canonically) and return its id.
+    /// The object is stored as an ordinary blob; its content_type records the
+    /// kind (`application/nous-<kind>`).
+    pub fn put_object(&self, obj: &Object) -> Result<ObjectId> {
+        let kind = format!("application/nous-{:?}", obj.kind()).to_lowercase();
+        let id = self.put(&obj.encode(), Some(kind))?;
+        debug_assert_eq!(id, obj.id());
+        Ok(id)
+    }
+
+    /// Load and decode a structured object (verifies bytes on read via `get`).
+    pub fn get_object(&self, id: &ObjectId) -> Result<Object> {
+        Object::decode(&self.get(id)?)
+    }
+
+    /// Load an object expected to be a [`Tree`].
+    pub fn get_tree(&self, id: &ObjectId) -> Result<Tree> {
+        match self.get_object(id)? {
+            Object::Tree(t) => Ok(t),
+            other => Err(Error::Other(format!("expected tree, got {:?}", other.kind()))),
+        }
+    }
+
+    /// Load an object expected to be a [`Commit`].
+    pub fn get_commit(&self, id: &ObjectId) -> Result<Commit> {
+        match self.get_object(id)? {
+            Object::Commit(c) => Ok(c),
+            other => Err(Error::Other(format!("expected commit, got {:?}", other.kind()))),
+        }
+    }
+
+    /// Load an object expected to be a [`Manifest`].
+    pub fn get_manifest(&self, id: &ObjectId) -> Result<Manifest> {
+        match self.get_object(id)? {
+            Object::Manifest(m) => Ok(m),
+            other => Err(Error::Other(format!("expected manifest, got {:?}", other.kind()))),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -404,5 +447,47 @@ mod tests {
         let ts = current_timestamp();
         std::env::remove_var("SOURCE_DATE_EPOCH");
         assert_eq!(ts, 1_000_000);
+    }
+
+    // -----------------------------------------------------------------------
+    // Typed objects (Phase 2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn put_get_tree_round_trip() {
+        use nous_core::{ObjectKind, Tree, TreeEntry};
+        let root = tmp_root("tree");
+        let store = Store::init(&root).unwrap();
+
+        let blob_id = store.put(b"hello", None).unwrap();
+        let tree = Tree::new(vec![TreeEntry {
+            name: "hello.txt".into(),
+            id: blob_id,
+            kind: ObjectKind::Blob,
+        }]);
+        let obj = Object::Tree(tree.clone());
+        let id = store.put_object(&obj).unwrap();
+
+        assert_eq!(id, obj.id());
+        assert_eq!(store.get_tree(&id).unwrap(), tree);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn get_tree_on_wrong_kind_errors() {
+        use nous_core::Commit;
+        let root = tmp_root("wrongkind");
+        let store = Store::init(&root).unwrap();
+        let commit = Object::Commit(Commit {
+            tree: store.put(b"x", None).unwrap(),
+            parents: vec![],
+            author: "a".into(),
+            message: "m".into(),
+            timestamp: 1,
+        });
+        let id = store.put_object(&commit).unwrap();
+        assert!(store.get_tree(&id).is_err());
+        assert!(store.get_commit(&id).is_ok());
+        fs::remove_dir_all(&root).ok();
     }
 }

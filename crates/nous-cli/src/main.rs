@@ -1,14 +1,15 @@
 //! `nous` — command-line interface for the Nous content-addressed store.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::str::FromStr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 
-use nous_caps::Capability;
-use nous_core::{ObjectId, Result};
+use nous_caps::{Capability, IssuerKey};
+use nous_core::{Error, ObjectId, Result};
 use nous_store::Store;
 
 // ---------------------------------------------------------------------------
@@ -117,6 +118,15 @@ enum Command {
         #[command(subcommand)]
         kind: GrantKind,
     },
+
+    /// Generate an Ed25519 issuer key for signing capabilities.
+    Keygen,
+
+    /// Verify and inspect a capability token.
+    VerifyCap {
+        /// The bearer token to verify.
+        token: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -128,6 +138,9 @@ enum GrantKind {
         /// Duration the token is valid for (e.g. 10m, 1h, 30s, 2d).
         #[arg(long)]
         ttl: String,
+        /// Sign the token with the store's issuer key (run `nous keygen` first).
+        #[arg(long)]
+        sign: bool,
     },
 }
 
@@ -139,6 +152,61 @@ fn nous_dir() -> nous_core::Result<PathBuf> {
     let cwd = std::env::current_dir()
         .map_err(|e| nous_core::Error::Io(e))?;
     Ok(cwd.join(".nous"))
+}
+
+fn issuer_key_path() -> Result<PathBuf> {
+    Ok(nous_dir()?.join("keys").join("issuer.key"))
+}
+
+/// Write secret bytes to `path` with owner-only permissions (0600 on unix).
+fn write_secret(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(Error::Io)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(Error::Io)?;
+        f.write_all(bytes).map_err(Error::Io)?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes).map_err(Error::Io)?;
+    }
+    Ok(())
+}
+
+/// Load the issuer key seed (32 bytes) from the store.
+fn load_issuer_key() -> Result<IssuerKey> {
+    let p = issuer_key_path()?;
+    let bytes = std::fs::read(&p).map_err(|_| {
+        Error::Cap(format!(
+            "no issuer key at {} — run `nous keygen` first",
+            p.display()
+        ))
+    })?;
+    let seed: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| Error::Cap("issuer key file is not 32 bytes".into()))?;
+    Ok(IssuerKey::from_seed(&seed))
+}
+
+/// Current Unix seconds from the real clock.
+///
+/// Does NOT honour `SOURCE_DATE_EPOCH`: this drives capability expiry checks,
+/// a security boundary that must not be influenced by environment variables.
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 // ---------------------------------------------------------------------------
@@ -217,17 +285,84 @@ fn run() -> Result<()> {
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().map_err(|e| {
                 nous_core::Error::Other(format!("invalid address: {e}"))
             })?;
-            nous_http::serve(store, addr, enforce_caps)?;
+            // When enforcing, trust only the store's own issuer key. Fail
+            // closed if no key exists (otherwise enforcement is meaningless).
+            let policy = if enforce_caps {
+                let key = load_issuer_key().map_err(|_| {
+                    Error::Cap(
+                        "`--enforce-caps` requires an issuer key; run `nous keygen` first"
+                            .to_string(),
+                    )
+                })?;
+                nous_http::CapPolicy {
+                    enforce: true,
+                    trusted_issuers: vec![key.public_b64()],
+                }
+            } else {
+                nous_http::CapPolicy::default()
+            };
+            nous_http::serve(store, addr, policy)?;
         }
 
         Command::Grant { kind } => match kind {
-            GrantKind::Read { cid, ttl } => {
+            GrantKind::Read { cid, ttl, sign } => {
                 let id = ObjectId::from_str(&cid)?;
                 let ttl_secs = parse_ttl(&ttl)?;
-                let cap = Capability::new_read(&id, ttl_secs);
+                let mut cap = Capability::new_read(&id, ttl_secs);
+                if sign {
+                    let key = load_issuer_key()?;
+                    cap.sign(&key);
+                }
                 println!("{}", cap.encode());
             }
         },
+
+        Command::Keygen => {
+            let path = issuer_key_path()?;
+            if path.exists() {
+                return Err(Error::Cap(format!(
+                    "issuer key already exists at {} — refusing to overwrite",
+                    path.display()
+                )));
+            }
+            let key = IssuerKey::generate()?;
+            let seed = zeroize::Zeroizing::new(key.to_seed_bytes());
+            write_secret(&path, seed.as_ref())?;
+            println!("issuer key created: {}", path.display());
+            println!("public key:         {}", key.public_b64());
+        }
+
+        Command::VerifyCap { token } => {
+            let cap = Capability::decode(&token)?;
+            let now = now_secs();
+            let signed = cap.alg != "none";
+            let sig_ok = cap.verify_signature();
+            let unexpired = cap.is_valid(now);
+
+            println!("cap_id:    {}", cap.cap_id);
+            println!("issuer:    {}", cap.issuer);
+            println!("resource:  {}", cap.resource);
+            println!("rights:    {:?}", cap.rights);
+            println!("alg:       {}", cap.alg);
+            println!("expiry:    {}", cap.expiry);
+            println!(
+                "signature: {}",
+                if !signed {
+                    "(unsigned)"
+                } else if sig_ok {
+                    "valid"
+                } else {
+                    "INVALID"
+                }
+            );
+            println!("expired:   {}", if unexpired { "no" } else { "yes" });
+
+            // Non-zero exit if a signed token fails its signature, or any token
+            // is expired.
+            if (signed && !sig_ok) || !unexpired {
+                process::exit(1);
+            }
+        }
     }
 
     Ok(())
