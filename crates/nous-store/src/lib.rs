@@ -26,6 +26,7 @@ use nous_core::{Error, Meta, ObjectId, Result};
 ///   logs/                 (reserved, empty)
 ///   tmp/                  staging area for atomic writes
 /// ```
+#[derive(Debug, Clone)]
 pub struct Store {
     root: PathBuf,
 }

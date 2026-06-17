@@ -10,7 +10,6 @@
 //!   - Missing / unparseable token → 401
 //!   - Valid token but not allowed for this cid/right → 403
 
-use std::io::Read;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -251,7 +250,7 @@ pub fn header_value<'a>(request: &'a Request, name: &str) -> Option<&'a str> {
     request
         .headers()
         .iter()
-        .find(|h| h.field.as_str().to_lowercase() == name_lower)
+        .find(|h| h.field.as_str().as_str().to_ascii_lowercase() == name_lower)
         .map(|h| h.value.as_str())
 }
 
