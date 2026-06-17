@@ -1,1 +1,0 @@
-/Users/suf/Desktop/Dev/nous/target/debug/libnous_core.rlib: /Users/suf/Desktop/Dev/nous/crates/nous-core/src/error.rs /Users/suf/Desktop/Dev/nous/crates/nous-core/src/id.rs /Users/suf/Desktop/Dev/nous/crates/nous-core/src/lib.rs /Users/suf/Desktop/Dev/nous/crates/nous-core/src/meta.rs /Users/suf/Desktop/Dev/nous/crates/nous-core/src/rights.rs
