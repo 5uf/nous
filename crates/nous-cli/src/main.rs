@@ -153,6 +153,33 @@ enum Command {
         commit: String,
     },
 
+    /// Wrap a content root in a named, versioned package (Manifest).
+    Package {
+        /// Root content id (usually a tree or commit).
+        root: String,
+        /// Package name.
+        #[arg(long)]
+        name: String,
+        /// Package version.
+        #[arg(long)]
+        version: String,
+    },
+
+    /// Export the object DAG reachable from a root into a portable archive.
+    Export {
+        /// Root content id.
+        root: String,
+        /// Output archive path.
+        #[arg(long)]
+        out: PathBuf,
+    },
+
+    /// Import a portable archive into the store (verifies every object).
+    Import {
+        /// Archive path.
+        file: PathBuf,
+    },
+
     /// Generate an Ed25519 issuer key for signing capabilities.
     Keygen,
 
@@ -417,6 +444,32 @@ fn run() -> Result<()> {
                 println!("    message: {}", c.message);
                 println!();
             }
+        }
+
+        Command::Package { root, name, version } => {
+            let id = ObjectId::from_str(&root)?;
+            let path = nous_dir()?;
+            let store = Store::open(&path)?;
+            let manifest =
+                nous_build::package(&store, id, &name, &version, std::collections::BTreeMap::new())?;
+            println!("{manifest}");
+        }
+
+        Command::Export { root, out } => {
+            let id = ObjectId::from_str(&root)?;
+            let path = nous_dir()?;
+            let store = Store::open(&path)?;
+            let archive = nous_build::export(&store, id)?;
+            std::fs::write(&out, &archive).map_err(Error::Io)?;
+            println!("exported {} bytes -> {}", archive.len(), out.display());
+        }
+
+        Command::Import { file } => {
+            let path = nous_dir()?;
+            let store = Store::open(&path)?;
+            let bytes = std::fs::read(&file).map_err(Error::Io)?;
+            let n = nous_build::import(&store, &bytes)?;
+            println!("imported {n} objects");
         }
 
         Command::Keygen => {

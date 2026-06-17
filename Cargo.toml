@@ -6,6 +6,7 @@ members = [
     "crates/nous-caps",
     "crates/nous-http",
     "crates/nous-bridge",
+    "crates/nous-build",
     "crates/nous-cli",
 ]
 

@@ -1,0 +1,8 @@
+[package]
+name    = "nous-build"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nous-core  = { path = "../nous-core" }
+nous-store = { path = "../nous-store" }

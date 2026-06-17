@@ -13,5 +13,6 @@ nous-store = { path = "../nous-store" }
 nous-caps  = { path = "../nous-caps" }
 nous-http   = { path = "../nous-http" }
 nous-bridge = { path = "../nous-bridge" }
+nous-build  = { path = "../nous-build" }
 clap        = { workspace = true }
 zeroize     = { workspace = true }

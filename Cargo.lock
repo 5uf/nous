@@ -390,6 +390,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nous-build"
+version = "0.1.0"
+dependencies = [
+ "nous-core",
+ "nous-store",
+]
+
+[[package]]
 name = "nous-caps"
 version = "0.1.0"
 dependencies = [
@@ -407,6 +415,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "nous-bridge",
+ "nous-build",
  "nous-caps",
  "nous-core",
  "nous-http",
